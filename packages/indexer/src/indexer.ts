@@ -123,7 +123,8 @@ export class Indexer {
     console.log(`  Indexed: ${componentTag} (${apiItems.length} API items)`);
   }
 
-  close() {
+  async close() {
+    await this.crawler.close();
     this.dbManager.close();
   }
 }

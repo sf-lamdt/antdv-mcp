@@ -1,4 +1,4 @@
-import fetch from 'node-fetch';
+import puppeteer, { Browser } from 'puppeteer';
 import * as cheerio from 'cheerio';
 import * as crypto from 'crypto';
 import { Version } from '@antdv-mcp/shared';
@@ -6,17 +6,41 @@ import { Version } from '@antdv-mcp/shared';
 export interface CrawlerOptions {
   userAgent?: string;
   delayMs?: number;
+  waitForSelector?: string;
+  timeout?: number;
 }
 
 export class Crawler {
   private userAgent: string;
   private delayMs: number;
+  private waitForSelector: string;
+  private timeout: number;
   private lastFetchTime: number = 0;
+  private browser: Browser | null = null;
 
   constructor(options: CrawlerOptions = {}) {
     this.userAgent =
       options.userAgent || 'antdv-mcp-indexer/1.0 (Documentation Indexer)';
     this.delayMs = options.delayMs || 1000;
+    this.waitForSelector = options.waitForSelector || '#app .main-container, #app .main-wrapper, #app article, #app .markdown';
+    this.timeout = options.timeout || 30000;
+  }
+
+  private async ensureBrowser(): Promise<Browser> {
+    if (!this.browser) {
+      this.browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      });
+    }
+    return this.browser;
+  }
+
+  async close(): Promise<void> {
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+    }
   }
 
   private async delay() {
@@ -32,20 +56,27 @@ export class Crawler {
     await this.delay();
 
     console.log(`Fetching: ${url}`);
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': this.userAgent,
-      },
-    });
+    const browser = await this.ensureBrowser();
+    const page = await browser.newPage();
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${url}`);
+    try {
+      await page.setUserAgent(this.userAgent);
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: this.timeout });
+
+      // Wait for SPA content to render
+      try {
+        await page.waitForSelector(this.waitForSelector, { timeout: this.timeout });
+      } catch {
+        console.warn(`Warning: selector "${this.waitForSelector}" not found on ${url}, using page as-is`);
+      }
+
+      const html = await page.content();
+      const sha256 = crypto.createHash('sha256').update(html).digest('hex');
+
+      return { html, sha256 };
+    } finally {
+      await page.close();
     }
-
-    const html = await response.text();
-    const sha256 = crypto.createHash('sha256').update(html).digest('hex');
-
-    return { html, sha256 };
   }
 
   extractText(html: string): string {
@@ -58,15 +89,14 @@ export class Crawler {
   async discoverComponents(version: Version): Promise<Array<{ url: string; title: string }>> {
     const overviewUrl =
       version === 'v3'
-        ? 'https://3x.antdv.com/components/overview-cn/'
-        : 'https://antdv.com/components/overview-cn/';
+        ? 'https://3x.antdv.com/components/overview/'
+        : 'https://antdv.com/components/overview/';
 
     const { html } = await this.fetchPage(overviewUrl);
     const $ = cheerio.load(html);
     const components: Array<{ url: string; title: string }> = [];
 
     // Find component links in the overview page
-    // Typical structure: links in sidebar or main content pointing to component pages
     const baseUrl = version === 'v3' ? 'https://3x.antdv.com' : 'https://antdv.com';
 
     $('a[href*="/components/"]').each((_, el) => {
@@ -77,8 +107,7 @@ export class Crawler {
         href &&
         title &&
         href.includes('/components/') &&
-        !href.includes('/overview') &&
-        href.endsWith('-cn')
+        !href.includes('/overview')
       ) {
         const fullUrl = href.startsWith('http') ? href : `${baseUrl}${href}`;
         if (!components.find((c) => c.url === fullUrl)) {
@@ -92,7 +121,7 @@ export class Crawler {
 
   extractComponentTag(url: string, $: cheerio.CheerioAPI): string {
     // Extract component tag from URL: /components/button-cn -> button
-    const match = url.match(/\/components\/([^/]+)-cn/);
+    const match = url.match(/\/components\/([^/]+)/);
     if (match) {
       const name = match[1];
       // Convert to tag format: button -> a-button
